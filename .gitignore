@@ -131,3 +131,6 @@ dmypy.json
 # Data folder
 shared_data/
 output/
+
+# Log file
+logs.txt
