@@ -1,0 +1,323 @@
+kubectl apply -f clickhouse-deploy.yaml
+kubectl get pods
+kubectl get svc
+kubectl exec --stdin --tty <pod> -- /bin/bash
+clickhouse-client
+
+##########################################################################################################################################
+
+SHOW DATABASES;
+
+SELECT cluster, shard_num, host_name, host_address, port, is_local FROM system.clusters;
+
+CREATE DATABASE IF NOT EXISTS vk ON CLUSTER cluster_1;
+
+CREATE TABLE vk.likes ON CLUSTER cluster_1
+(
+    item_type String,
+    owner_id Int64,
+    item_id Int64,
+    liker_id Int64,
+    ctime DateTime,
+    like_date DateTime,
+    post_date DateTime
+)
+ENGINE = MergeTree()
+PARTITION BY toYear(post_date)
+ORDER BY (liker_id, owner_id, item_id);
+
+CREATE TABLE vk.distr_likes ON CLUSTER cluster_1 AS vk.likes
+ENGINE = Distributed(cluster_1, vk, likes, xxHash64(owner_id));
+
+##########################################################################################################################################
+
+SELECT count() FROM vk.distr_likes;
+
+>>> cat likes.json | clickhouse-client --query="INSERT INTO vk.distr_likes FORMAT JSONEachRow"
+
+>>> likes.json | wc -l
+
+SELECT count() FROM vk.distr_likes;
+
+SELECT count() FROM vk.likes;
+
+SELECT table, formatReadableSize(sum(data_compressed_bytes)) FROM system.parts WHERE database='vk' AND active=1 GROUP BY database, table;
+
+>>> du -sh likes.json
+
+SELECT owner_id, count() as cnt FROM vk.distr_likes GROUP BY owner_id ORDER BY cnt DESC LIMIT 10;
+
+##########################################################################################################################################
+
+CREATE TABLE vk.user_profiles ON CLUSTER cluster_1
+(
+    ctime DateTime,
+    id Int64,
+    first_name String,
+    last_name String,
+    screen_name Nullable(String),
+    maiden_name Nullable(String),
+    nickname Nullable(String),
+    bdate Nullable(String),
+    birth_date Nullable(UInt32),
+    sex Int16,
+    deactivated Int8,
+    is_closed Nullable(Int8),
+    verified Int8,
+    followers_count Nullable(Int64),
+    status Nullable(String),
+    city_id Int32,
+    city_title Nullable(String),
+    country_id Int32,
+    country_title Nullable(String),
+    mobile_phone Nullable(String),
+    home_phone Nullable(String),
+    tv Nullable(String),
+    twitter Nullable(String),
+    livejournal Nullable(String),
+    facebook Nullable(String),
+    site Nullable(String),
+    skype Nullable(String),
+    instagram Nullable(String),
+    about Nullable(String),
+    activities Nullable(String),
+    books Nullable(String),
+    home_town Nullable(String),
+    interests Nullable(String),
+    movies Nullable(String),
+    music Nullable(String),
+    games Nullable(String),
+    quotes Nullable(String),
+    domain Nullable(String),
+    personal_alcohol Nullable(Int8),
+    personal_inspired_by Nullable(String),
+    personal_langs Array(Nullable(String)),
+    personal_life_main Nullable(Int8),
+    personal_people_main Nullable(Int8),
+    personal_political Nullable(Int16),
+    personal_religion Nullable(String),
+    personal_smoking Nullable(Int8),
+    relation Nullable(Int8),
+    relation_partner_first_name Nullable(String),
+    relation_partner_id Nullable(Int64),
+    relation_partner_last_name Nullable(String),
+    photo_id Nullable(String),
+    photo_max_url Nullable(String),
+    crop_photo_album_id Nullable(Int64),
+    crop_photo_date Nullable(DateTime),
+    crop_photo_id Nullable(Int64),
+    crop_photo_lat Nullable(Float64),
+    crop_photo_long Nullable(Float64),
+    crop_photo_owner_id Nullable(Int64),
+    crop_photo_max Nullable(Int32),
+    crop_photo_max_url Nullable(String),
+    crop_photo_post_id Nullable(Int64),
+    crop_photo_text Nullable(String),
+    occupation_id Nullable(Int64),
+    occupation_name Nullable(String),
+    occupation_type Nullable(String),
+    education_form Nullable(Int8),
+    education_status Nullable(String),
+    faculty Nullable(Int32),
+    faculty_name Nullable(String),
+    graduation Nullable(UInt32),
+    university Nullable(Int32),
+    university_name Nullable(String),
+
+    relatives Nested
+    (
+        user_id Nullable(Int64),
+        name Nullable(String),
+        type Nullable(String)
+    ),
+
+    career Nested
+    (
+        company Nullable(String),
+        group_id Nullable(Int64),
+        city_id Nullable(Int32),
+        country_id Nullable(Int32),
+        position Nullable(String),
+        from Nullable(UInt32),
+        until Nullable(UInt32)
+    ),
+
+    schools Nested
+    (
+        city_id Nullable(Int32),
+        class Nullable(String),
+        country_id Nullable(Int32),
+        id Nullable(Int32),
+        name Nullable(String),
+        speciality Nullable(String),
+        type Nullable(UInt8),
+        type_str Nullable(String),
+        year_from Nullable(UInt16),
+        year_graduated Nullable(UInt16),
+        year_to Nullable(UInt16)
+    ),
+
+    universities Nested
+    (
+        chair Nullable(UInt32),
+        chair_name Nullable(String),
+        education_form Nullable(String),
+        education_status Nullable(String),
+        faculty Nullable(UInt32),
+        faculty_name Nullable(String),
+        graduation Nullable(UInt32),
+        id Nullable(Int32),
+        name Nullable(String)
+    )
+)
+ENGINE = MergeTree()
+ORDER BY (id);
+
+CREATE TABLE vk.distr_user_profiles ON CLUSTER cluster_1 AS vk.user_profiles
+ENGINE = Distributed(cluster_1, vk, user_profiles, xxHash64(id));
+
+CREATE MATERIALIZED VIEW vk.mv_likes ON CLUSTER cluster_1
+ENGINE = AggregatingMergeTree()
+ORDER BY (owner_id, likes_count)
+POPULATE
+AS SELECT
+    owner_id,
+    count() AS likes_count
+FROM vk.likes
+GROUP BY owner_id;
+
+CREATE TABLE vk.distr_mv_likes ON CLUSTER cluster_1 AS vk.mv_likes
+ENGINE = Distributed(cluster_1, vk, mv_likes);
+
+>>> cat /shared-data/clickhouse_data/user_profiles.json | clickhouse-client --query="INSERT INTO vk.distr_user_profiles FORMAT JSONEachRow"
+
+##########################################################################################################################################
+
+SELECT liker_id, first_name, count() as cnt FROM
+(
+SELECT * FROM vk.distr_likes as l
+GLOBAL INNER JOIN vk.distr_user_profiles as p
+ON l.liker_id = p.id
+)
+GROUP BY liker_id, first_name ORDER BY cnt DESC LIMIT 10;
+
+SET distributed_product_mode='local';
+SELECT owner_id, first_name, count() as cnt FROM
+(
+SELECT * FROM vk.distr_likes as l
+INNER JOIN vk.distr_user_profiles as p
+ON l.owner_id = p.id
+)
+GROUP BY owner_id, first_name ORDER BY cnt DESC LIMIT 10;
+
+SELECT * FROM vk.mv_likes LIMIT 5;
+
+SELECT owner_id, countMerge(likes_count) as likes_count FROM vk.mv_likes GROUP BY owner_id LIMIT 5;
+
+SELECT owner_id, countMerge(likes_count) as likes_count FROM vk.distr_mv_likes GROUP BY owner_id LIMIT 5;
+
+SELECT owner_id, countMerge(likes_count) as likes_count FROM vk.mv_likes WHERE owner_id=-34137285 GROUP BY owner_id LIMIT 5;
+
+>>> cat likes.json | clickhouse-client --query="INSERT INTO vk.distr_likes FORMAT JSONEachRow"
+
+SELECT owner_id, countMerge(likes_count) as likes_count FROM vk.mv_likes WHERE owner_id=-34137285 GROUP BY owner_id LIMIT 5;
+
+SELECT table, formatReadableSize(sum(data_compressed_bytes)) FROM system.parts WHERE database='vk' AND active=1 GROUP BY database, table;
+
+##########################################################################################################################################
+
+CREATE TABLE IF NOT EXISTS vk.followers  ON CLUSTER cluster_1 (
+    profile_id Int64,
+    follower_id Int64,
+    ctime DateTime
+)
+ENGINE = MergeTree()
+ORDER BY (profile_id, follower_id);
+
+CREATE MATERIALIZED VIEW vk.followers_queue_mv on cluster cluster_1 TO vk.followers AS
+SELECT profile_id, follower_id, ctime
+FROM vk.followers_queue;
+
+
+CREATE TABLE IF NOT EXISTS vk.followers_queue  ON CLUSTER cluster_1 (
+    ctime DateTime,
+    follower_id Int64,
+    profile_id Int64
+)
+ENGINE = Kafka()
+SETTINGS
+    kafka_broker_list = 'localhost:9092',
+    kafka_topic_list = 'followers',
+    kafka_group_name = 'followers_consumer_group1',
+    kafka_format = 'JSONEachRow',
+    kafka_skip_broken_messages = 1,
+    kafka_num_consumers = 1;
+    
+>>> cat followers.json | sudo docker run -i --rm --network="clickhouse-net" --link clickhouse-01:clickhouse-server yandex/clickhouse-client --host clickhouse-server  --query="INSERT INTO vk.followers FORMAT JSONEachRow"
+
+>>> /home/shyju/Documents/kafka_2.11-2.4.1/bin/kafka-console-producer.sh --broker-list localhost:9092 --topic followers < followers.json
+
+CREATE TABLE vk.distr_followers ON CLUSTER cluster_1 AS vk.followers
+ENGINE = Distributed(cluster_1, vk, followers, xxHash64(profile_id));
+
+##########################################################################################################################################
+
+CREATE TABLE IF NOT EXISTS vk.friends ON CLUSTER cluster_1 (
+    user_id Int64,
+    friend_id Int64,
+    ctime DateTime
+)
+ENGINE = MergeTree()
+ORDER BY (user_id, friend_id);
+
+>>> cat friends.json | sudo docker run -i --rm --network="clickhouse-net" --link clickhouse-01:clickhouse-server yandex/clickhouse-client --host clickhouse-server --input_format_skip_unknown_fields=1 --query="INSERT INTO vk.friends FORMAT JSONEachRow"
+
+CREATE TABLE vk.distr_friends ON CLUSTER cluster_1 AS vk.friends
+ENGINE = Distributed(cluster_1, vk, friends, xxHash64(user_id));
+
+##########################################################################################################################################
+
+CREATE TABLE vk.posts on cluster cluster_1 (
+    date DateTime, 
+    comments_count Nullable(Int16),
+    from_id Nullable(String),
+    likes_count Nullable(Int16), 
+    owner_id String, 
+    post_id Int16,
+    post_type Nullable(String), 
+    text Nullable(String), 
+    views_count Nullable(Int16), 
+    reposts_count Nullable(Int16)
+) Engine = MergeTree
+ORDER BY (post_id, date);
+
+CREATE TABLE vk.posts_queue on cluster cluster_1 (
+    date DateTime, 
+    comments_count Nullable(Int16),
+    from_id Nullable(String),
+    likes_count Nullable(Int16), 
+    owner_id String, 
+    post_id Int16,
+    post_type Nullable(String), 
+    text Nullable(String), 
+    views_count Nullable(Int16), 
+    reposts_count Nullable(Int16)
+)
+ENGINE = Kafka
+SETTINGS kafka_broker_list = 'localhost:9092',
+         kafka_topic_list = 'posts',
+         kafka_group_name = 'posts_consumer_group1',
+         kafka_format = 'JSONEachRow',
+         kafka_skip_broken_messages = 1,
+	 kafka_num_consumers = 1;
+
+CREATE MATERIALIZED VIEW vk.posts_queue_mv on cluster cluster_1 TO vk.posts AS SELECT date,comments_count,from_id,likes_count,owner_id,post_id,post_type,text,views_count,reposts_count FROM vk.posts_queue;
+
+>>> cat posts.json | sudo docker run -i --rm --network="clickhouse-net" --link clickhouse-01:clickhouse-server yandex/clickhouse-client --host clickhouse-server --input_format_skip_unknown_fields=1 --query="INSERT INTO vk.posts FORMAT JSONEachRow"
+
+>>> /home/shyju/Documents/kafka_2.11-2.4.1/bin/kafka-console-producer.sh --broker-list localhost:9092 --topic posts < posts.json
+
+CREATE TABLE vk.distr_posts ON CLUSTER cluster_1 AS vk.posts
+ENGINE = Distributed(cluster_1, vk, posts, xxHash64(post_id));
+
+##########################################################################################################################################
