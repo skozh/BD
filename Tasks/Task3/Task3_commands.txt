@@ -1,8 +1,8 @@
-kubectl apply -f clickhouse-deploy.yaml
-kubectl get pods
-kubectl get svc
-kubectl exec --stdin --tty <pod> -- /bin/bash
-clickhouse-client
+# Run cluster
+sudo docker-compose up -d --no-recreate
+
+# Run client
+sudo docker run -it --rm --network="clickhouse-net" --link clickhouse-01:clickhouse-server yandex/clickhouse-client --host clickhouse-server
 
 ##########################################################################################################################################
 
@@ -24,7 +24,11 @@ CREATE TABLE vk.likes ON CLUSTER cluster_1
 )
 ENGINE = MergeTree()
 PARTITION BY toYear(post_date)
-ORDER BY (liker_id, owner_id, item_id);
+ORDER BY (liker_id, owner_id, item_id)
+SETTINGS
+	max_partitions_to_read=10
+	max_parts_in_total=10000
+	
 
 CREATE TABLE vk.distr_likes ON CLUSTER cluster_1 AS vk.likes
 ENGINE = Distributed(cluster_1, vk, likes, xxHash64(owner_id));
@@ -234,15 +238,11 @@ CREATE TABLE IF NOT EXISTS vk.followers  ON CLUSTER cluster_1 (
 ENGINE = MergeTree()
 ORDER BY (profile_id, follower_id);
 
-CREATE MATERIALIZED VIEW vk.followers_queue_mv on cluster cluster_1 TO vk.followers AS
-SELECT profile_id, follower_id, ctime
-FROM vk.followers_queue;
-
 
 CREATE TABLE IF NOT EXISTS vk.followers_queue  ON CLUSTER cluster_1 (
-    ctime DateTime,
-    follower_id Int64,
-    profile_id Int64
+    ctime String,
+    follower_id String,
+    profile_id String
 )
 ENGINE = Kafka()
 SETTINGS
@@ -252,6 +252,10 @@ SETTINGS
     kafka_format = 'JSONEachRow',
     kafka_skip_broken_messages = 1,
     kafka_num_consumers = 1;
+
+CREATE MATERIALIZED VIEW vk.followers_queue_mv on cluster cluster_1 TO vk.followers AS
+SELECT profile_id, follower_id, ctime
+FROM vk.followers_queue;
     
 >>> cat followers.json | sudo docker run -i --rm --network="clickhouse-net" --link clickhouse-01:clickhouse-server yandex/clickhouse-client --host clickhouse-server  --query="INSERT INTO vk.followers FORMAT JSONEachRow"
 
@@ -283,7 +287,7 @@ CREATE TABLE vk.posts on cluster cluster_1 (
     from_id Nullable(String),
     likes_count Nullable(Int16), 
     owner_id String, 
-    post_id Int16,
+    post_id UInt16,
     post_type Nullable(String), 
     text Nullable(String), 
     views_count Nullable(Int16), 
@@ -297,7 +301,7 @@ CREATE TABLE vk.posts_queue on cluster cluster_1 (
     from_id Nullable(String),
     likes_count Nullable(Int16), 
     owner_id String, 
-    post_id Int16,
+    post_id UInt16,
     post_type Nullable(String), 
     text Nullable(String), 
     views_count Nullable(Int16), 
@@ -321,3 +325,42 @@ CREATE TABLE vk.distr_posts ON CLUSTER cluster_1 AS vk.posts
 ENGINE = Distributed(cluster_1, vk, posts, xxHash64(post_id));
 
 ##########################################################################################################################################
+
+CREATE MATERIALIZED VIEW vk.mv_users_long_posts ON CLUSTER cluster_1
+ENGINE = AggregatingMergeTree()
+ORDER BY cnt;
+POPULATE AS
+SELECT　concat(users.first_name,' ',users.last_name) as full_name,　users.sex,　posts.cnt FROM (　SELECT　owner_id,　count(post_id) as cnt FROM vk.posts　WHERE length(text) > 255　GROUP BY owner_id　) posts　INNER JOIN vk.user_profiles as users ON abs(toUInt64(replaceOne(toString(users.id), '-', ''))) = abs(toUInt64(replaceOne(posts.owner_id, '-', '')))　
+
+
+
+CREATE TABLE vk.distr_mv_users_long_posts ON CLUSTER cluster_1 AS vk.mv_users_long_posts
+ENGINE = Distributed(cluster_1, vk, mv_users_long_posts);
+
+##########################################################################################################################################
+
+CREATE MATERIALIZED VIEW vk.mv_users_most_friends ON CLUSTER cluster_1
+ENGINE = AggregatingMergeTree()
+ORDER BY cnt
+POPULATE AS
+SELECT　concat(users.first_name,' ',users.last_name) as full_name,　users.sex,　friends.cnt FROM (　SELECT　user_id,　count(friend_id) as cnt FROM vk.friends GROUP BY user_id　HAVING cnt>1000) friends　INNER JOIN vk.user_profiles as users ON users.id = friends.user_id;
+
+
+CREATE TABLE vk.distr_mv_users_most_friends ON CLUSTER cluster_1 AS vk.mv_users_most_friends
+ENGINE = Distributed(cluster_1, vk, mv_users_most_friends);
+
+##########################################################################################################################################
+
+CREATE ROLE viewers;
+GRANT SELECT ON db.vk TO viewers;
+
+CREATE USER developer1 DEFAULT ROLE viewer;
+
+##########################################################################################################################################
+
+CREATE TABLE IF NOT EXISTS vk.repl_followers on CLUSTER cluster_1(
+　    profile_id Int64,
+　    follower_id Int64,
+　    ctime DateTime　
+)ENGINE = ReplicatedMergeTree('/clickhouse/tables/01-03/repl_followers', 'repl_followers')
+ORDER BY (profile_id, follower_id)
