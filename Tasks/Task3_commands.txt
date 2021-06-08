@@ -182,11 +182,10 @@ ENGINE = Distributed(cluster_1, vk, user_profiles, xxHash64(id));
 
 CREATE MATERIALIZED VIEW vk.mv_likes ON CLUSTER cluster_1
 ENGINE = AggregatingMergeTree()
-ORDER BY (likes_count)
+ORDER BY (owner_id)
 POPULATE
-AS select owner_id, countMerge(likes_count) as likes_count from 
+AS 
 (SELECT owner_id, countState() AS likes_count FROM vk.likes GROUP BY owner_id) 
-group by owner_id 
 
 
 CREATE TABLE vk.distr_mv_likes ON CLUSTER cluster_1 AS vk.mv_likes
@@ -328,20 +327,16 @@ ENGINE = Distributed(cluster_1, vk, posts, xxHash64(post_id));
 
 CREATE MATERIALIZED VIEW vk.mv_users_long_posts ON CLUSTER cluster_1
 ENGINE = AggregatingMergeTree()
-ORDER BY cnt
+ORDER BY full_name
 POPULATE AS
 (
 SELECT
     concat(users.first_name, ' ', users.last_name) AS full_name,
     users.sex,
-    posts.cnt
+    posts.*
 FROM 
-(
-    SELECT owner_id, countMerge(post_id) AS cnt　    
-    FROM (select owner_id, countState(post_id) as post_id 
-    from vk.posts WHERE length(text) > 255 GROUP BY owner_id) 
-    GROUP BY owner_id
-
+(select owner_id, countState(post_id) as post_id
+ from vk.posts WHERE length(text) > 255 GROUP BY owner_id
 ) AS posts
 INNER JOIN vk.user_profiles AS users ON abs(toUInt64(replaceOne(toString(users.id), '-', ''))) = abs(toUInt64(replaceOne(posts.owner_id, '-', '')))
 )
@@ -353,9 +348,9 @@ ENGINE = Distributed(cluster_1, vk, mv_users_long_posts);
 
 CREATE MATERIALIZED VIEW vk.mv_users_most_friends ON CLUSTER cluster_1
 ENGINE = AggregatingMergeTree()
-ORDER BY cnt
+ORDER BY full_name
 POPULATE AS
-SELECT　concat(users.first_name,' ',users.last_name) as full_name,　users.sex,　friends.cnt　FROM (　SELECT　user_id,　countMerge(friend_id) as cnt FROM (select user_id, countState(friend_id) as friend_id from vk.friends GROUP BY user_id) GROUP BY user_id) friends　INNER JOIN vk.user_profiles as users ON users.id = friends.user_id;
+SELECT　concat(users.first_name,' ',users.last_name) as full_name,　users.sex,　friends.*　FROM (select user_id, countState(friend_id) as friend_id from vk.friends GROUP BY user_id) friends　INNER JOIN vk.user_profiles as users ON users.id = friends.user_id;
 
 CREATE TABLE vk.distr_mv_users_most_friends ON CLUSTER cluster_1 AS vk.mv_users_most_friends
 ENGINE = Distributed(cluster_1, vk, mv_users_most_friends);
@@ -369,10 +364,10 @@ CREATE USER developer1 DEFAULT ROLE viewer;
 
 ##########################################################################################################################################
 
-CREATE TABLE IF NOT EXISTS vk.followers_2 on CLUSTER cluster_1(
+CREATE TABLE IF NOT EXISTS vk.followers1_final on CLUSTER cluster_1(
 　    profile_id Int64,
 　    follower_id Int64,
 　    ctime DateTime　
-)ENGINE = ReplicatedMergeTree('/clickhouse/tables/followers_2/shard-{shard}', '{replica}')
+)ENGINE = ReplicatedMergeTree('/clickhouse/tables/followers1_final/shard-{shard}', '{replica}')
 PARTITION BY toYYYYMM(ctime)
 ORDER BY (profile_id, follower_id)
