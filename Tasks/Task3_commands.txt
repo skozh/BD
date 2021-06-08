@@ -182,16 +182,16 @@ ENGINE = Distributed(cluster_1, vk, user_profiles, xxHash64(id));
 
 CREATE MATERIALIZED VIEW vk.mv_likes ON CLUSTER cluster_1
 ENGINE = AggregatingMergeTree()
-ORDER BY (owner_id, likes_count)
+ORDER BY (likes_count)
 POPULATE
-AS SELECT
-    owner_id,
-    count() AS likes_count
-FROM vk.likes
-GROUP BY owner_id;
+AS select owner_id, countMerge(likes_count) as likes_count from 
+(SELECT owner_id, countState() AS likes_count FROM vk.likes GROUP BY owner_id) 
+group by owner_id 
+
 
 CREATE TABLE vk.distr_mv_likes ON CLUSTER cluster_1 AS vk.mv_likes
 ENGINE = Distributed(cluster_1, vk, mv_likes);
+
 
 >>> cat /shared-data/clickhouse_data/user_profiles.json | clickhouse-client --query="INSERT INTO vk.distr_user_profiles FORMAT JSONEachRow"
 
@@ -287,7 +287,7 @@ CREATE TABLE vk.posts on cluster cluster_1 (
     from_id Nullable(String),
     likes_count Nullable(Int16), 
     owner_id String, 
-    post_id UInt16,
+    post_id Int64,
     post_type Nullable(String), 
     text Nullable(String), 
     views_count Nullable(Int16), 
@@ -328,11 +328,23 @@ ENGINE = Distributed(cluster_1, vk, posts, xxHash64(post_id));
 
 CREATE MATERIALIZED VIEW vk.mv_users_long_posts ON CLUSTER cluster_1
 ENGINE = AggregatingMergeTree()
-ORDER BY cnt;
+ORDER BY cnt
 POPULATE AS
-SELECT　concat(users.first_name,' ',users.last_name) as full_name,　users.sex,　posts.cnt FROM (　SELECT　owner_id,　count(post_id) as cnt FROM vk.posts　WHERE length(text) > 255　GROUP BY owner_id　) posts　INNER JOIN vk.user_profiles as users ON abs(toUInt64(replaceOne(toString(users.id), '-', ''))) = abs(toUInt64(replaceOne(posts.owner_id, '-', '')))　
+(
+SELECT
+    concat(users.first_name, ' ', users.last_name) AS full_name,
+    users.sex,
+    posts.cnt
+FROM 
+(
+    SELECT owner_id, countMerge(post_id) AS cnt　    
+    FROM (select owner_id, countState(post_id) as post_id 
+    from vk.posts WHERE length(text) > 255 GROUP BY owner_id) 
+    GROUP BY owner_id
 
-
+) AS posts
+INNER JOIN vk.user_profiles AS users ON abs(toUInt64(replaceOne(toString(users.id), '-', ''))) = abs(toUInt64(replaceOne(posts.owner_id, '-', '')))
+)
 
 CREATE TABLE vk.distr_mv_users_long_posts ON CLUSTER cluster_1 AS vk.mv_users_long_posts
 ENGINE = Distributed(cluster_1, vk, mv_users_long_posts);
@@ -343,8 +355,7 @@ CREATE MATERIALIZED VIEW vk.mv_users_most_friends ON CLUSTER cluster_1
 ENGINE = AggregatingMergeTree()
 ORDER BY cnt
 POPULATE AS
-SELECT　concat(users.first_name,' ',users.last_name) as full_name,　users.sex,　friends.cnt FROM (　SELECT　user_id,　count(friend_id) as cnt FROM vk.friends GROUP BY user_id　HAVING cnt>1000) friends　INNER JOIN vk.user_profiles as users ON users.id = friends.user_id;
-
+SELECT　concat(users.first_name,' ',users.last_name) as full_name,　users.sex,　friends.cnt　FROM (　SELECT　user_id,　countMerge(friend_id) as cnt FROM (select user_id, countState(friend_id) as friend_id from vk.friends GROUP BY user_id) GROUP BY user_id) friends　INNER JOIN vk.user_profiles as users ON users.id = friends.user_id;
 
 CREATE TABLE vk.distr_mv_users_most_friends ON CLUSTER cluster_1 AS vk.mv_users_most_friends
 ENGINE = Distributed(cluster_1, vk, mv_users_most_friends);
@@ -358,9 +369,10 @@ CREATE USER developer1 DEFAULT ROLE viewer;
 
 ##########################################################################################################################################
 
-CREATE TABLE IF NOT EXISTS vk.repl_followers on CLUSTER cluster_1(
+CREATE TABLE IF NOT EXISTS vk.followers_2 on CLUSTER cluster_1(
 　    profile_id Int64,
 　    follower_id Int64,
 　    ctime DateTime　
-)ENGINE = ReplicatedMergeTree('/clickhouse/tables/01-03/repl_followers', 'repl_followers')
+)ENGINE = ReplicatedMergeTree('/clickhouse/tables/followers_2/shard-{shard}', '{replica}')
+PARTITION BY toYYYYMM(ctime)
 ORDER BY (profile_id, follower_id)
